@@ -1,0 +1,1023 @@
+"""
+FishLab Complete System - Snapshot + YOLO Tracking (Standalone)
+===============================================================
+- Recording: unchanged (no YOLO, no delay, no risk)
+- Dashboard: shows live annotated frames with bounding boxes
+- Uses your sophisticated SingleFishTracker (one fish per camera)
+- No external config.py or state.py needed — fully standalone!
+
+Requirements:
+    pip install flask requests opencv-python-headless numpy waitress ultralytics
+    cloudflared.exe must be at C:\\cloudflared\\cloudflared.exe
+
+Set your model path below, then run:
+    python fishlab_yolo.py
+
+Open: http://localhost:5000
+"""
+
+from __future__ import annotations
+
+import cv2
+import itertools
+import math
+import os, sys, time, datetime, threading, subprocess, signal
+import requests
+import numpy as np
+from collections import deque
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+# ─────────────────────────────────────────────────────────────
+# AUTO-INSTALL ultralytics if not present
+# ─────────────────────────────────────────────────────────────
+try:
+    import ultralytics
+    print(f"[Setup] ultralytics {ultralytics.__version__} already installed ✅")
+except ImportError:
+    print("[Setup] ultralytics not found — installing now...")
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "ultralytics", "--quiet"],
+        check=True
+    )
+    print("[Setup] ultralytics installed successfully ✅")
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
+from flask import Flask, Response, render_template_string, jsonify, send_file, request as freq, abort
+
+# ─────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────
+
+CAMERA_IPS = [
+    f"192.168.20.{i}"
+    for i in list(range(101, 121)) + list(range(121, 141)) + list(range(141, 161))
+    if i not in {101, 102, 133,139,137,112,115,149,154,131,153, 157, 110,119,116,136,141,106,132,117,126,125,111,109,159, 143, 142, 144, 145, 146, 147, 148, 108, 107, 103, 104, 105, 113, 114, 118, 120, 122, 123, 124, 128, 129, 134, 160, 150, 151, 152, 156, 158}
+]
+
+EXPERIMENT_START   = datetime.datetime(2026, 3, 10, 6, 0, 0)
+VIDEO_DURATION     = 600
+FPS                = 5
+FRAME_INTERVAL     = 1.0 / FPS
+TOTAL_FRAMES       = VIDEO_DURATION * FPS
+ROOT_FOLDER        = "C:/Users/Nothospan Vision/Desktop/video10min"
+REPORTS_ROOT       = os.path.join(ROOT_FOLDER, "reports")
+DASHBOARD_PORT     = 5000
+CLOUDFLARED_EXE    = r"C:\cloudflared\cloudflared.exe"
+GOOGLE_SCRIPT_URL  = "https://script.google.com/macros/s/AKfycbxZML36LrSBNY2hJq5iqmGRnJI-DPf0Cy-rS7HFNovs-WaZHEDjQQHUXVYitEzpO-Jd/exec"
+
+# ── TRACKING CONFIG ────────────────────────────────────────────
+YOLO_MODEL_PATH  = r"C:\Users\Nothospan Vision\Desktop\fish_model.pt"  # ← change this!
+CONF_THRESHOLD   = 0.3    # detection confidence (0.0-1.0)
+MAX_JUMP         = 0.3    # max normalised distance between frames (rejects glare)
+LOST_AFTER       = 5      # frames without detection before "lost"
+QUEUE_SIZE       = 4      # max queued frames per camera (drops oldest if full)
+WORKERS          = 2      # inference worker threads (keep low for CPU)
+IMGSZ            = 320    # inference image size (matches your camera resolution)
+TOP_K            = 5      # max candidates considered per frame
+
+# ── TRACKING DATA SAVE CONFIG ──────────────────────────────────
+# Position text files saved here: ROOT_FOLDER/tracking/ip/date/HH-MM-SS.txt
+TRACKING_FOLDER  = os.path.join("C:/Users/Nothospan Vision/Desktop/video10min", "tracking")
+
+os.makedirs(ROOT_FOLDER,  exist_ok=True)
+os.makedirs(REPORTS_ROOT, exist_ok=True)
+os.makedirs(TRACKING_FOLDER, exist_ok=True)
+
+# ─────────────────────────────────────────────────────────────
+# SHUTDOWN
+# ─────────────────────────────────────────────────────────────
+
+_all_processes = []
+
+def _shutdown(sig=None, frame=None):
+    print("\n[Shutdown] Stopping all processes...")
+    for p in _all_processes:
+        try: p.terminate()
+        except: pass
+    sys.exit(0)
+
+signal.signal(signal.SIGINT,  _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
+
+# ─────────────────────────────────────────────────────────────
+# TRACKING CORE (standalone — no external imports needed)
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class Candidate:
+    """Raw detection in normalised (0-1) frame coordinates."""
+    x: float
+    y: float
+    w: float
+    h: float
+    conf: float
+
+@dataclass
+class Detection:
+    """Confirmed detection published to the dashboard."""
+    x: float
+    y: float
+    w: float
+    h: float
+    conf: float
+    state: str  # "locked" or "lost"
+
+
+class SingleFishTracker:
+    """
+    Per-camera association: assumes ONE fish per aquarium.
+    Uses position continuity to reject glare and reflections.
+    """
+    def __init__(self, max_jump: float = MAX_JUMP,
+                 lost_after: int = LOST_AFTER) -> None:
+        self._max_jump   = max_jump
+        self._lost_after = lost_after
+        self.last: Optional[Candidate] = None
+        self.misses = 0
+
+    def update(self, candidates: list[Candidate]) -> tuple[Optional[Candidate], str]:
+        if not candidates:
+            self.misses += 1
+            if self.misses >= self._lost_after:
+                self.last = None
+                return None, "lost"
+            # brief dropout — hold last position, don't flicker
+            return (self.last, "locked") if self.last else (None, "lost")
+
+        chosen = candidates[0]  # highest confidence first
+        if self.last is not None:
+            # prefer candidates closest to last known position
+            near = [c for c in candidates
+                    if math.hypot(c.x - self.last.x, c.y - self.last.y) <= self._max_jump]
+            if near:
+                chosen = min(near,
+                             key=lambda c: math.hypot(c.x - self.last.x, c.y - self.last.y))
+        self.last  = chosen
+        self.misses = 0
+        return chosen, "locked"
+
+    def reset(self) -> None:
+        self.last   = None
+        self.misses = 0
+
+
+class UltralyticsBackend:
+    """Runs inference using your .pt model directly."""
+    def __init__(self, model_path: str) -> None:
+        from ultralytics import YOLO
+        self._model = YOLO(model_path)
+        self._lock  = threading.Lock()
+        print(f"[YOLO] Model loaded: {model_path}")
+
+    def detect(self, frame_bgr: np.ndarray) -> list[Candidate]:
+        h, w = frame_bgr.shape[:2]
+        with self._lock:
+            res = self._model.predict(
+                frame_bgr,
+                imgsz=IMGSZ,
+                conf=CONF_THRESHOLD,
+                verbose=False,
+            )[0]
+        out: list[Candidate] = []
+        for box in res.boxes[:TOP_K]:
+            x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
+            out.append(Candidate(
+                x=((x1 + x2) / 2) / w,
+                y=((y1 + y2) / 2) / h,
+                w=(x2 - x1) / w,
+                h=(y2 - y1) / h,
+                conf=float(box.conf[0]),
+            ))
+        return out
+
+    def close(self) -> None:
+        self._model = None
+
+
+# ─────────────────────────────────────────────────────────────
+# SNAPSHOT + ANNOTATED STORE
+# ─────────────────────────────────────────────────────────────
+
+snapshot_store  = {}   # ip → latest raw JPEG bytes (from recording)
+annotated_store = {}   # ip → latest annotated JPEG bytes (from YOLO)
+detection_store = {}   # ip → Detection or None
+snapshot_lock   = threading.Lock()
+annotated_lock  = threading.Lock()
+detection_lock  = threading.Lock()
+camera_status   = {ip: "starting" for ip in CAMERA_IPS}
+status_lock     = threading.Lock()
+
+def _make_placeholder(text, color=(20, 20, 20)):
+    img = np.full((240, 320, 3), color, dtype=np.uint8)
+    cv2.putText(img, text, (10, 120), cv2.FONT_HERSHEY_SIMPLEX,
+                0.55, (120, 120, 120), 1, cv2.LINE_AA)
+    _, buf = cv2.imencode('.jpg', img)
+    return buf.tobytes()
+
+DARK_FRAME  = _make_placeholder("DARK PERIOD", (10, 10, 20))
+ERROR_FRAME = _make_placeholder("NO SIGNAL",   (20, 8, 8))
+
+for ip in CAMERA_IPS:
+    snapshot_store[ip]  = ERROR_FRAME
+    annotated_store[ip] = ERROR_FRAME
+    detection_store[ip] = None
+    camera_status[ip]   = "starting"
+
+# ─────────────────────────────────────────────────────────────
+# TRACKER SERVICE
+# Bounded drop-oldest queue feeding inference workers
+# Never blocks recording threads!
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class _Job:
+    ip:    str
+    frame: np.ndarray
+
+class TrackerService:
+    """
+    Rotating inference queue — processes one frame per camera at a time.
+    CPU-friendly: WORKERS inference threads, bounded queue drops old frames.
+    """
+    def __init__(self) -> None:
+        self._backend  = None
+        self._trackers: dict[str, SingleFishTracker] = {
+            ip: SingleFishTracker() for ip in CAMERA_IPS
+        }
+        self._cond     = threading.Condition()
+        self._queue: deque[_Job] = deque()
+        self._running  = True
+        self._workers  = [
+            threading.Thread(target=self._worker,
+                             name=f"track-{i}", daemon=True)
+            for i in range(max(1, WORKERS))
+        ]
+
+    def start(self) -> None:
+        """Load model and start worker threads."""
+        try:
+            self._backend = UltralyticsBackend(YOLO_MODEL_PATH)
+            # warm up
+            dummy = np.zeros((240, 320, 3), dtype=np.uint8)
+            self._backend.detect(dummy)
+            print("[YOLO] Warm-up done ✅")
+        except Exception as e:
+            print(f"[YOLO] Failed to load model: {e}")
+            print("[YOLO] Dashboard will show raw frames without tracking")
+            self._backend = None
+        for w in self._workers:
+            w.start()
+        print(f"[YOLO] {WORKERS} worker thread(s) started")
+
+    def submit(self, ip: str, frame: np.ndarray) -> None:
+        """
+        Submit a frame for inference. Never blocks.
+        Drops the oldest frame if queue is full.
+        """
+        with self._cond:
+            if not self._running:
+                return
+            # drop oldest if full
+            while len(self._queue) >= QUEUE_SIZE * len(CAMERA_IPS):
+                self._queue.popleft()
+            self._queue.append(_Job(ip=ip, frame=frame))
+            self._cond.notify()
+
+    def _worker(self) -> None:
+        while True:
+            with self._cond:
+                while self._running and not self._queue:
+                    self._cond.wait(0.5)
+                if not self._running and not self._queue:
+                    return
+                job = self._queue.popleft()
+            self._process(job)
+
+    def _process(self, job: _Job) -> None:
+        ip    = job.ip
+        frame = job.frame.copy()
+
+        # Run detection
+        if self._backend is None:
+            candidates = []
+        else:
+            try:
+                candidates = self._backend.detect(frame)
+            except Exception as e:
+                print(f"[YOLO] Inference error on {ip}: {e}")
+                candidates = []
+
+        # Associate with tracker
+        tracker          = self._trackers[ip]
+        chosen, state    = tracker.update(candidates)
+
+        # Store detection result
+        det = None
+        if chosen is not None:
+            det = Detection(
+                x=chosen.x, y=chosen.y,
+                w=chosen.w, h=chosen.h,
+                conf=chosen.conf, state=state
+            )
+        with detection_lock:
+            detection_store[ip] = det
+
+        # Save position to tracking text file (non-blocking)
+        write_tracking_row(ip, det, datetime.datetime.now())
+
+        # Draw annotation on frame
+        annotated = self._draw(frame, det, ip)
+        _, buf = cv2.imencode('.jpg', annotated,
+                              [cv2.IMWRITE_JPEG_QUALITY, 80])
+        with annotated_lock:
+            annotated_store[ip] = buf.tobytes()
+
+    def _draw(self, frame: np.ndarray,
+              det: Optional[Detection], ip: str) -> np.ndarray:
+        """Draw bounding box + position on frame."""
+        h, w = frame.shape[:2]
+
+        if det is not None and det.state == "locked":
+            # Convert normalised coords to pixels
+            cx = int(det.x * w)
+            cy = int(det.y * h)
+            bw = int(det.w * w)
+            bh = int(det.h * h)
+            x1 = max(0, cx - bw // 2)
+            y1 = max(0, cy - bh // 2)
+            x2 = min(w, cx + bw // 2)
+            y2 = min(h, cy + bh // 2)
+
+            # Bounding box — bright green
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 100), 2)
+
+            # Label with confidence
+            label = f"Fish {det.conf:.0%}"
+            cv2.putText(frame, label, (x1, max(y1 - 6, 10)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                        (0, 255, 100), 1, cv2.LINE_AA)
+
+            # Center dot
+            cv2.circle(frame, (cx, cy), 4, (0, 255, 255), -1)
+
+            # Position info bottom-left
+            pos_label = f"x:{det.x:.2f} y:{det.y:.2f}"
+            cv2.putText(frame, pos_label, (4, h - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (0, 200, 200), 1, cv2.LINE_AA)
+        else:
+            # Not detected — show dim indicator
+            cv2.putText(frame, "no", (4, h - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                        (80, 80, 80), 1, cv2.LINE_AA)
+
+        # Camera IP top-right
+        cv2.putText(frame, ip.split(".")[-1], (w - 28, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38,
+                    (60, 60, 60), 1, cv2.LINE_AA)
+        return frame
+
+    def stop(self) -> None:
+        with self._cond:
+            self._running = False
+            self._cond.notify_all()
+        for w in self._workers:
+            w.join(timeout=2.0)
+        if self._backend:
+            self._backend.close()
+
+
+# Global tracker service
+tracker_service = TrackerService()
+
+# ─────────────────────────────────────────────────────────────
+# TRACKING FILE WRITER
+# Saves position data to text files — one file per camera per 10-min batch
+# Format: timestamp  frame  x  y  w  h  conf  state
+# Files saved to: TRACKING_FOLDER/ip/date/HH-MM-SS.txt
+# ─────────────────────────────────────────────────────────────
+
+# file handles: ip → open file object
+_track_files: dict[str, object] = {}
+_track_lock  = threading.Lock()
+_track_frame_counters: dict[str, int] = {ip: 0 for ip in CAMERA_IPS}
+
+def _get_track_file(ip: str, batch_start: datetime.datetime):
+    """Get or create the tracking text file for this camera + batch."""
+    cam_folder = os.path.join(
+        TRACKING_FOLDER, ip, batch_start.strftime("%Y-%m-%d"))
+    os.makedirs(cam_folder, exist_ok=True)
+    start_str = batch_start.strftime("%H-%M-%S")
+    end_str   = (batch_start + datetime.timedelta(
+                  seconds=VIDEO_DURATION)).strftime("%H-%M-%S")
+    path = os.path.join(cam_folder, f"{start_str}-{end_str}_{ip}.txt")
+    f = open(path, "w", encoding="utf-8")
+    # Write header
+    f.write("timestamp\tframe\tx\ty\tw\th\tconf\tstate\n")
+    f.flush()
+    return f
+
+def write_tracking_row(ip: str, det, batch_start: datetime.datetime) -> None:
+    """
+    Called by TrackerService after each inference.
+    Writes one row per frame to the tracking text file.
+    Non-blocking — uses a lock only for the file dict.
+    """
+    with _track_lock:
+        if ip not in _track_files or _track_files[ip] is None:
+            return
+        f = _track_files[ip]
+        _track_frame_counters[ip] = _track_frame_counters.get(ip, 0) + 1
+        frame_idx = _track_frame_counters[ip]
+
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    if det is not None:
+        row = (f"{ts}\t{frame_idx}\t"
+               f"{det.x:.4f}\t{det.y:.4f}\t"
+               f"{det.w:.4f}\t{det.h:.4f}\t"
+               f"{det.conf:.3f}\tdetection\n")
+    else:
+        row = f"{ts}\t{frame_idx}\tNA\tNA\tNA\tNA\tNA\tno\n"
+
+    try:
+        f.write(row)
+        f.flush()
+    except Exception as e:
+        print(f"[Tracking] Write error {ip}: {e}")
+
+def open_tracking_files(active_cameras: list, batch_start: datetime.datetime) -> None:
+    """Open one tracking file per active camera at batch start."""
+    with _track_lock:
+        for ip in active_cameras:
+            # Close previous file if open
+            old = _track_files.get(ip)
+            if old:
+                try: old.close()
+                except: pass
+            _track_files[ip]           = _get_track_file(ip, batch_start)
+            _track_frame_counters[ip]  = 0
+    print(f"[Tracking] Opened tracking files for {len(active_cameras)} cameras")
+
+def close_tracking_files() -> None:
+    """Close all open tracking files."""
+    with _track_lock:
+        for ip, f in _track_files.items():
+            if f:
+                try: f.close()
+                except: pass
+        _track_files.clear()
+
+
+# ─────────────────────────────────────────────────────────────
+# CLOUDFLARE TUNNEL
+# ─────────────────────────────────────────────────────────────
+
+def start_cloudflare():
+    if not os.path.exists(CLOUDFLARED_EXE):
+        print(f"[Cloudflare] WARNING: not found at {CLOUDFLARED_EXE}")
+        return
+    print("[Cloudflare] Starting tunnel...")
+
+    def _run():
+        cmd = [CLOUDFLARED_EXE, "tunnel", "--protocol", "http2",
+               "--url", f"http://localhost:{DASHBOARD_PORT}"]
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
+        _all_processes.append(p)
+        for line in p.stdout:
+            line = line.strip()
+            if "trycloudflare.com" in line:
+                print("\n" + "=" * 58)
+                print("  🌍 REMOTE ACCESS URL:")
+                for word in line.split():
+                    if "trycloudflare.com" in word:
+                        print(f"  {word}")
+                        break
+                print("  Open this on your phone or home PC!")
+                print("=" * 58 + "\n")
+            elif "ERR" in line and "context canceled" not in line:
+                print(f"[Cloudflare] {line}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
+# ─────────────────────────────────────────────────────────────
+# LIGHT CYCLE HELPERS
+# ─────────────────────────────────────────────────────────────
+
+def get_camera_number(ip):
+    return int(ip.split(".")[-1])
+
+def get_cycle_hours(ip):
+    n = get_camera_number(ip)
+    if 101 <= n <= 120: return 6
+    if 121 <= n <= 140: return 12
+    return 18
+
+def should_record(ip, now=None):
+    try:
+        now = now or datetime.datetime.now()
+        if now < EXPERIMENT_START:
+            return True
+        elapsed   = (now - EXPERIMENT_START).total_seconds()
+        block_idx = int(elapsed // (get_cycle_hours(ip) * 3600))
+        return (block_idx % 2) == 0
+    except:
+        return True
+
+def get_group(ip):
+    n = get_camera_number(ip)
+    if 101 <= n <= 120: return "A"
+    if 121 <= n <= 140: return "B"
+    return "C"
+
+def get_active_cameras(now=None):
+    now = now or datetime.datetime.now()
+    return [ip for ip in CAMERA_IPS if should_record(ip, now)]
+
+# ─────────────────────────────────────────────────────────────
+# RECORDING — completely unchanged, no YOLO here!
+# ─────────────────────────────────────────────────────────────
+
+def write_batch_report(report_path, date_str, start_str, end_str, results):
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(f"Date: {date_str}\nTime range: {start_str}-{end_str}\n\n")
+        f.write(f"{'Camera IP':<20}{'Black frames':<25}{'Good frames':<15}{'Total':<15}\n")
+        f.write("-" * 75 + "\n")
+        for item in sorted(results, key=lambda x: x["ip"]):
+            f.write(f"{item['ip']:<20}{item['black_frames']:<25}"
+                    f"{item['good_frames']:<15}{item['total_frames']:<15}\n")
+
+def send_to_google_sheet(results, batch_start):
+    time_label   = batch_start.strftime("%H:%M")
+    cameras_data = {item["ip"].split(".")[-1]: item["black_frames"] for item in results}
+    try:
+        r = requests.post(GOOGLE_SCRIPT_URL,
+                          json={"time": time_label, "cameras": cameras_data},
+                          timeout=10)
+        print(f"[Sheets] Updated: {r.text[:80]}")
+    except Exception as e:
+        print(f"[Sheets] Failed: {e}")
+
+def record_video(ip, batch_start, barrier):
+    capture_url = f"http://{ip}:81/capture"
+
+    if not should_record(ip, batch_start):
+        with snapshot_lock:
+            snapshot_store[ip] = DARK_FRAME
+        with annotated_lock:
+            annotated_store[ip] = DARK_FRAME
+        with status_lock:
+            camera_status[ip] = "dark"
+        barrier.wait()
+        return {"ip": ip, "good_frames": 0, "black_frames": 0,
+                "total_frames": TOTAL_FRAMES, "status": "skipped"}
+
+    cam_folder = os.path.join(ROOT_FOLDER, ip, batch_start.strftime("%Y-%m-%d"))
+    os.makedirs(cam_folder, exist_ok=True)
+    start_str = batch_start.strftime("%H-%M-%S")
+    end_str   = (batch_start + datetime.timedelta(seconds=VIDEO_DURATION)).strftime("%H-%M-%S")
+    avi_path  = os.path.join(cam_folder, f"{start_str}-{end_str}_{ip}.avi")
+
+    fourcc = cv2.VideoWriter_fourcc(*"XVID")
+    out    = cv2.VideoWriter(avi_path, fourcc, FPS, (320, 240))
+    black  = np.zeros((240, 320, 3), dtype=np.uint8)
+    session = requests.Session()
+    frames_ok  = 0
+    frames_bad = 0
+
+    def write_bad_frame():
+        nonlocal frames_bad
+        out.write(black)
+        frames_bad += 1
+        with snapshot_lock:
+            snapshot_store[ip] = ERROR_FRAME
+        with status_lock:
+            camera_status[ip] = "error"
+
+    print(f"{ip} ready, waiting for all cameras...")
+    barrier.wait()
+    rec_start = time.monotonic()
+
+    try:
+        for idx in range(TOTAL_FRAMES):
+            target_time = rec_start + idx * FRAME_INTERVAL
+            wait = target_time - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+            try:
+                resp = session.get(capture_url, timeout=0.3)
+                if resp.status_code != 200:
+                    write_bad_frame()
+                    continue
+
+                jpeg_bytes = resp.content
+                arr   = np.frombuffer(jpeg_bytes, dtype=np.uint8)
+                frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
+                if frame is None:
+                    write_bad_frame()
+                    continue
+
+                frame = cv2.resize(frame, (320, 240))
+                out.write(frame)
+                frames_ok += 1
+
+                # Share raw frame with snapshot store
+                with snapshot_lock:
+                    snapshot_store[ip] = jpeg_bytes
+                with status_lock:
+                    camera_status[ip] = "ok"
+
+                # Submit frame to YOLO tracker (non-blocking!)
+                tracker_service.submit(ip, frame)
+
+            except requests.exceptions.Timeout:
+                write_bad_frame()
+            except Exception as e:
+                print(f"[Rec] {ip} error: {e}")
+                write_bad_frame()
+    finally:
+        out.release()
+        session.close()
+
+    print(f"[Rec] {ip}: good={frames_ok} black={frames_bad}")
+    return {"ip": ip, "good_frames": frames_ok, "black_frames": frames_bad,
+            "total_frames": TOTAL_FRAMES, "video_path": avi_path, "status": "recorded"}
+
+def recording_loop():
+    while True:
+        batch_start    = datetime.datetime.now()
+        active_cameras = get_active_cameras(batch_start)
+        print(f"\n[Rec] {batch_start.strftime('%H:%M:%S')} — "
+              f"{len(active_cameras)}/{len(CAMERA_IPS)} cameras active")
+        if active_cameras:
+            # Open tracking files for this batch
+            open_tracking_files(active_cameras, batch_start)
+            barrier = Barrier(len(active_cameras))
+            with ThreadPoolExecutor(max_workers=len(active_cameras)) as ex:
+                futures = [ex.submit(record_video, ip, batch_start, barrier)
+                           for ip in active_cameras]
+                results = [f.result() for f in futures]
+            date_str  = batch_start.strftime("%Y-%m-%d")
+            start_str = batch_start.strftime("%H-%M-%S")
+            end_str   = (batch_start + datetime.timedelta(
+                          seconds=VIDEO_DURATION)).strftime("%H-%M-%S")
+            rpt_dir   = os.path.join(REPORTS_ROOT, date_str)
+            os.makedirs(rpt_dir, exist_ok=True)
+            write_batch_report(
+                os.path.join(rpt_dir, f"{start_str}-{end_str}.txt"),
+                date_str, start_str, end_str, results)
+            send_to_google_sheet(results, batch_start)
+            # Close tracking files for this batch
+            close_tracking_files()
+        else:
+            time.sleep(VIDEO_DURATION)
+
+# ─────────────────────────────────────────────────────────────
+# FLASK DASHBOARD
+# ─────────────────────────────────────────────────────────────
+
+app = Flask(__name__)
+app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FishLab Monitor + Tracking</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow:wght@300;400;600&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0e12;--panel:#12171f;--panel2:#181e28;
+  --border:#1e2736;--border2:#263040;
+  --green:#2ecc8a;--blue:#3a9eff;--red:#ff4f4f;--yellow:#f5c518;
+  --text:#adc0cc;--dim:#3d5060;--white:#d8e8f0;
+  --mono:'Share Tech Mono',monospace;
+  --sans:'Barlow',sans-serif;
+}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);
+  min-height:100vh;display:flex;flex-direction:column;overflow-x:hidden}
+header{display:flex;align-items:center;justify-content:space-between;
+  padding:10px 20px;background:var(--panel);
+  border-bottom:2px solid var(--border2);position:sticky;top:0;z-index:100}
+.logo{font-family:var(--mono);font-size:1.05rem;letter-spacing:4px;color:var(--green)}
+.logo span{color:var(--blue)}
+.hright{display:flex;gap:14px;align-items:center}
+.badge{font-family:var(--mono);font-size:.68rem;padding:3px 10px;
+  border-radius:20px;border:1px solid}
+.badge.g{border-color:#1a4a36;color:var(--green);background:#061a10}
+.badge.y{border-color:#4a3a10;color:var(--yellow);background:#1a1206}
+#clock{font-family:var(--mono);font-size:.78rem;color:var(--dim)}
+main{flex:1;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.gp{background:var(--panel);border:1px solid var(--border2);border-radius:5px;overflow:hidden}
+.gh{display:flex;align-items:center;justify-content:space-between;
+  padding:7px 14px;background:var(--panel2);
+  border-bottom:1px solid var(--border);border-left:3px solid var(--green)}
+.gh.B{border-left-color:var(--blue)}.gh.C{border-left-color:var(--yellow)}
+.gtitle{font-family:var(--mono);font-size:.76rem;letter-spacing:2px;
+  color:var(--white);font-weight:600}
+.gmeta{font-family:var(--mono);font-size:.65rem;color:var(--dim)}
+.cgrid{display:grid;grid-template-columns:repeat(10,1fr);gap:3px;padding:6px}
+.ct{border-radius:3px;overflow:hidden;border:1px solid var(--border);
+  background:#080b0e;cursor:pointer;position:relative;
+  transition:border-color .15s,transform .12s}
+.ct:hover{border-color:var(--green);transform:scale(1.06);z-index:10}
+.ct.ok{border-color:#0d2e1e}.ct.dark{border-color:#151030;opacity:.5}
+.ct.error{border-color:#2e0d0d}.ct.starting{border-color:#1a1a2e;opacity:.6}
+.ct img{width:100%;aspect-ratio:4/3;display:block;object-fit:cover;background:#000}
+.clabel{font-family:var(--mono);font-size:.55rem;
+  padding:2px 4px;background:#060a0d;
+  display:flex;justify-content:space-between;align-items:center}
+.clabel .ip{color:var(--dim)}
+.st{font-size:.52rem;padding:1px 4px;border-radius:2px}
+.st.ok{color:var(--green)}.st.dark{color:#7060b0}
+.st.error{color:var(--red)}.st.starting{color:var(--blue)}
+.rp{background:var(--panel);border:1px solid var(--border2);border-radius:5px;overflow:hidden}
+.rh{display:flex;align-items:center;justify-content:space-between;
+  padding:7px 14px;background:var(--panel2);border-bottom:1px solid var(--border)}
+.rh-title{font-family:var(--mono);font-size:.76rem;letter-spacing:2px;color:var(--white)}
+.rbtn{font-family:var(--mono);font-size:.62rem;padding:3px 10px;border-radius:3px;
+  background:#06182a;border:1px solid #1a3a5a;color:var(--blue);cursor:pointer}
+.rbtn:hover{background:#0a2040}
+.rlist{padding:6px 14px;max-height:150px;overflow-y:auto}
+.rrow{display:flex;justify-content:space-between;align-items:center;
+  padding:4px 0;border-bottom:1px solid var(--border);font-size:.7rem}
+.rrow:last-child{border:none}
+.rname{font-family:var(--mono);font-size:.65rem;color:var(--text)}
+.rdl{font-family:var(--mono);font-size:.6rem;padding:2px 8px;border-radius:2px;
+  background:#06182a;border:1px solid #1a3a5a;color:var(--blue);cursor:pointer}
+.rdl:hover{background:#0a2040}
+.novid{color:var(--dim);font-size:.72rem;padding:8px 0}
+footer{display:flex;gap:20px;padding:6px 20px;
+  background:var(--panel);border-top:1px solid var(--border);
+  font-family:var(--mono);font-size:.68rem;color:var(--dim)}
+footer b{color:var(--blue)}
+#modal{display:none;position:fixed;inset:0;background:#000000ee;z-index:500;
+  flex-direction:column;align-items:center;justify-content:center;gap:8px}
+#modal.open{display:flex}
+#modal img{width:min(88vw,960px);aspect-ratio:4/3;object-fit:cover;
+  border:1px solid var(--green);border-radius:4px;background:#000}
+#mtitle{font-family:var(--mono);color:var(--green);font-size:.9rem}
+#mpos{font-family:var(--mono);color:var(--blue);font-size:.75rem}
+#mclose{position:absolute;top:16px;right:22px;
+  font-size:2rem;color:var(--dim);cursor:pointer;line-height:1}
+#mclose:hover{color:var(--red)}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">FISH<span>LAB</span> // LIVE TRACKER</div>
+  <div class="hright">
+    <div class="badge g" id="b-ok">LIVE: 0</div>
+    <div class="badge y" id="b-dark">DARK: 0</div>
+    <div id="clock"></div>
+  </div>
+</header>
+<main>
+  {% for gname, gips in groups.items() %}
+  <div class="gp">
+    <div class="gh {{ gname }}">
+      <span class="gtitle">GROUP {{ gname }} &nbsp;·&nbsp; CAM {{ gips[0].split('.')[-1] }}–{{ gips[-1].split('.')[-1] }}</span>
+      <span class="gmeta">{{ gips|length }} cameras</span>
+    </div>
+    <div class="cgrid">
+      {% for ip in gips %}
+      {% set key = ip.replace('.','_') %}
+      {% set num = ip.split('.')[-1] %}
+      <div class="ct starting" id="t-{{key}}" onclick="openModal('{{ip}}')">
+        <img id="img-{{key}}" src="/snap/{{ip}}" alt="{{ip}}" loading="lazy">
+        <div class="clabel">
+          <span class="ip">.{{num}}</span>
+          <span class="st starting" id="s-{{key}}">···</span>
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endfor %}
+  <div class="rp">
+    <div class="rh">
+      <span class="rh-title">SAVED RECORDINGS</span>
+      <button class="rbtn" onclick="loadVideos()">REFRESH</button>
+    </div>
+    <div class="rlist" id="rlist"><div class="novid">Loading...</div></div>
+  </div>
+</main>
+<footer>
+  <span>LIVE <b id="f-ok">0</b></span>
+  <span>DARK <b id="f-dark">0</b></span>
+  <span>TOTAL <b>{{ total_all }}</b></span>
+</footer>
+<div id="modal">
+  <div id="mclose" onclick="closeModal()">×</div>
+  <div id="mtitle">--</div>
+  <div id="mpos">--</div>
+  <img id="mimg" src="" alt="fullscreen">
+</div>
+<script>
+const cameras  = {{ camera_ips|tojson }};
+const totalAll = {{ total_all }};
+let activeModal  = null;
+let detections   = {};
+
+function updateClock(){
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+}
+setInterval(updateClock, 200); updateClock();
+
+// Refresh annotated snapshots every 500ms
+function refreshSnapshots(){
+  const t = Date.now();
+  cameras.forEach(ip=>{
+    const key = ip.replace(/\./g,'_');
+    const img = document.getElementById('img-'+key);
+    if(img && ip !== activeModal){
+      img.src = '/snap/'+ip+'?t='+t;
+    }
+  });
+  if(activeModal){
+    document.getElementById('mimg').src = '/snap/'+activeModal+'?t='+t;
+  }
+}
+setInterval(refreshSnapshots, 500);
+
+// Update camera status every 5 seconds
+function updateStatus(){
+  fetch('/status').then(r=>r.json()).then(data=>{
+    let ok=0, dark=0;
+    cameras.forEach(ip=>{
+      const key = ip.replace(/\./g,'_');
+      const st  = data[ip]||'starting';
+      const tile= document.getElementById('t-'+key);
+      const stEl= document.getElementById('s-'+key);
+      if(!tile||!stEl) return;
+      tile.className = 'ct '+st;
+      stEl.className = 'st '+st;
+      stEl.textContent = st==='ok'?'LIVE':st==='dark'?'DARK':st==='error'?'ERR':'···';
+      if(st==='ok') ok++; else if(st==='dark') dark++;
+    });
+    document.getElementById('f-ok').textContent   = ok;
+    document.getElementById('f-dark').textContent  = totalAll - ok;
+    document.getElementById('b-ok').textContent   = 'LIVE: '+ok;
+    document.getElementById('b-dark').textContent = 'DARK: '+(totalAll-ok);
+  });
+}
+setInterval(updateStatus, 5000); updateStatus();
+
+// Update detection positions every 2 seconds
+function updateDetections(){
+  fetch('/detections').then(r=>r.json()).then(data=>{
+    detections = data;
+    // Update modal position info if open
+    if(activeModal && data[activeModal]){
+      const d = data[activeModal];
+      if(d){
+        document.getElementById('mpos').textContent =
+          `x: ${d.x.toFixed(3)}  y: ${d.y.toFixed(3)}  conf: ${(d.conf*100).toFixed(0)}%  state: detection`;
+      } else {
+        document.getElementById('mpos').textContent = 'no detection';
+      }
+    }
+  });
+}
+setInterval(updateDetections, 2000); updateDetections();
+
+function openModal(ip){
+  activeModal = ip;
+  document.getElementById('mtitle').textContent = ip;
+  document.getElementById('mimg').src = '/snap/'+ip+'?t='+Date.now();
+  const d = detections[ip];
+  if(d){
+    document.getElementById('mpos').textContent =
+      `x: ${d.x.toFixed(3)}  y: ${d.y.toFixed(3)}  conf: ${(d.conf*100).toFixed(0)}%`;
+  } else {
+    document.getElementById('mpos').textContent = 'no detection';
+  }
+  document.getElementById('modal').classList.add('open');
+}
+function closeModal(){
+  activeModal = null;
+  document.getElementById('modal').classList.remove('open');
+}
+document.addEventListener('keydown',e=>{ if(e.key==='Escape') closeModal(); });
+
+function loadVideos(){
+  fetch('/videos').then(r=>r.json()).then(data=>{
+    const el = document.getElementById('rlist');
+    if(!data.length){
+      el.innerHTML='<div class="novid">No recordings yet.</div>';
+      return;
+    }
+    el.innerHTML = data.slice(0,100).map(v=>
+      `<div class="rrow">
+        <span class="rname">${v.name}</span>
+        <button class="rdl" onclick="location='/download?path=${encodeURIComponent(v.path)}'">DOWNLOAD</button>
+      </div>`
+    ).join('');
+  });
+}
+loadVideos();
+setInterval(loadVideos, 60000);
+</script>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    now    = datetime.datetime.now()
+    active = get_active_cameras(now)
+    groups = {"A":[],"B":[],"C":[]}
+    for ip in active:
+        groups[get_group(ip)].append(ip)
+    groups = {k:v for k,v in groups.items() if v}
+    return render_template_string(HTML,
+        groups=groups,
+        camera_ips=active,
+        total=len(active),
+        total_all=len(CAMERA_IPS))
+
+@app.route('/snap/<ip>')
+def snapshot(ip):
+    """Return latest annotated JPEG (with bounding box) for dashboard."""
+    with annotated_lock:
+        data = annotated_store.get(ip, ERROR_FRAME)
+    return Response(data, mimetype='image/jpeg',
+                    headers={'Cache-Control': 'no-cache'})
+
+@app.route('/detections')
+def detections():
+    """Return latest detection per camera as JSON."""
+    with detection_lock:
+        result = {}
+        for ip, det in detection_store.items():
+            if det is not None:
+                result[ip] = {
+                    "x":     round(det.x, 4),
+                    "y":     round(det.y, 4),
+                    "w":     round(det.w, 4),
+                    "h":     round(det.h, 4),
+                    "conf":  round(det.conf, 3),
+                    "state": det.state,
+                }
+            else:
+                result[ip] = None
+    return jsonify(result)
+
+@app.route('/status')
+def status():
+    with status_lock:
+        return jsonify(dict(camera_status))
+
+@app.route('/videos')
+def videos():
+    result = []
+    for root, dirs, files in os.walk(ROOT_FOLDER):
+        for f in sorted(files, reverse=True):
+            if f.endswith('.avi'):
+                result.append({"name": f, "path": os.path.join(root, f)})
+                if len(result) >= 200: break
+    return jsonify(result)
+
+@app.route('/download')
+def download():
+    path = freq.args.get('path','')
+    if not path or not os.path.exists(path):
+        abort(404)
+    return send_file(path, as_attachment=True)
+
+# ─────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────
+
+if __name__ == '__main__':
+    print("=" * 58)
+    print("  FishLab — YOLO Tracking Version")
+    print("=" * 58)
+    print(f"  Cameras : {len(CAMERA_IPS)}")
+    print(f"  Model   : {YOLO_MODEL_PATH}")
+    print(f"  Workers : {WORKERS}")
+
+    # Start YOLO tracker service (loads model)
+    tracker_service.start()
+
+    # Start Cloudflare tunnel
+    start_cloudflare()
+
+    # Start recording loop
+    t_rec = threading.Thread(target=recording_loop, daemon=True)
+    t_rec.start()
+    print("[Recorder] Background recording started")
+
+    print(f"\n  Dashboard  : http://localhost:{DASHBOARD_PORT}")
+    print(f"  Recordings : {ROOT_FOLDER}")
+    print(f"  Tracking   : {TRACKING_FOLDER}")
+    print("=" * 58)
+
+    from waitress import serve
+    serve(app, host='0.0.0.0', port=DASHBOARD_PORT, threads=16)
